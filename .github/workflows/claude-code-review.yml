@@ -1,0 +1,101 @@
+name: Claude Code Review
+
+on:
+  pull_request:
+    types: [opened, synchronize, ready_for_review, reopened]
+    # Optional: Only run on specific file changes
+    # paths:
+    #   - "src/**/*.ts"
+    #   - "src/**/*.tsx"
+    #   - "src/**/*.js"
+    #   - "src/**/*.jsx"
+
+jobs:
+  claude-review:
+    # Optional: Filter by PR author
+    # if: |
+    #   github.event.pull_request.user.login == 'external-contributor' ||
+    #   github.event.pull_request.user.login == 'new-developer' ||
+    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
+
+    runs-on:
+      group: Self-Hosted-Linux
+    permissions:
+      contents: read
+      pull-requests: write  # Required for posting review comments
+      issues: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Install GitHub CLI
+        run: |
+          if ! command -v gh &> /dev/null; then
+            echo "Installing GitHub CLI (user-local, no sudo required)..."
+            GH_VERSION=$(curl -s https://api.github.com/repos/cli/cli/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | sed 's/^v//')
+            curl -sSL "https://github.com/cli/cli/releases/download/v${GH_VERSION}/gh_${GH_VERSION}_linux_amd64.tar.gz" -o /tmp/gh.tar.gz
+            mkdir -p "$HOME/.local/bin"
+            tar -xzf /tmp/gh.tar.gz -C /tmp
+            mv "/tmp/gh_${GH_VERSION}_linux_amd64/bin/gh" "$HOME/.local/bin/gh"
+            chmod +x "$HOME/.local/bin/gh"
+            rm -rf /tmp/gh.tar.gz /tmp/gh_${GH_VERSION}_linux_amd64
+            echo "$HOME/.local/bin" >> $GITHUB_PATH
+            echo "GitHub CLI installed: $($HOME/.local/bin/gh --version)"
+          else
+            echo "GitHub CLI already installed: $(gh --version)"
+          fi
+
+      - name: Clean Claude marketplace cache (self-hosted runner workaround)
+        run: |
+          # Remove marketplace directories
+          rm -rf ~/.claude/plugins/marketplaces/claude-code-plugins 2>/dev/null || true
+          rm -rf ~/.claude/plugins/cache/claude-code-plugins 2>/dev/null || true
+          # Remove marketplace from known_marketplaces.json registry
+          if [ -f ~/.claude/plugins/known_marketplaces.json ]; then
+            # Remove the claude-code-plugins entry from the JSON file
+            python3 -c "
+          import json
+          try:
+              with open('$HOME/.claude/plugins/known_marketplaces.json', 'r') as f:
+                  data = json.load(f)
+              # Filter out claude-code-plugins entries
+              if isinstance(data, list):
+                  data = [m for m in data if 'claude-code-plugins' not in str(m)]
+              elif isinstance(data, dict):
+                  data = {k: v for k, v in data.items() if 'claude-code-plugins' not in k}
+              with open('$HOME/.claude/plugins/known_marketplaces.json', 'w') as f:
+                  json.dump(data, f)
+          except Exception as e:
+              print(f'Warning: Could not update known_marketplaces.json: {e}')
+          " 2>/dev/null || true
+          fi
+          echo "Marketplace cache cleaned"
+
+      - name: Run Claude Code Review
+        id: claude-review
+        uses: anthropics/claude-code-action@v1
+        env:
+          GH_TOKEN: ${{ github.token }}  # Required for gh CLI authentication
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          claude_code_oauth_token: ${{ secrets.CLAUDE_CODE_OAUTH_TOKEN }}
+          claude_args: '--model ${{ vars.CLAUDE_MODEL || ''sonnet'' }} --effort ${{ vars.CLAUDE_REVIEW_EFFORT || ''medium'' }}'
+          # Using custom detailed-code-review command from .claude/commands/ instead of marketplace plugin
+          # This provides richer verification output and error handling
+          prompt: '/detailed-code-review ${{ github.repository }}/pull/${{ github.event.pull_request.number }}'
+          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
+          # or https://code.claude.com/docs/en/cli-reference for available options
+
+      - name: Upload Claude Execution Logs
+        if: always() && steps.claude-review.outputs.execution_file != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: claude-review-logs-${{ github.run_id }}
+          path: ${{ steps.claude-review.outputs.execution_file }}
+          retention-days: 7
+          if-no-files-found: ignore
+
